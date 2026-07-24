@@ -3,6 +3,7 @@ package group
 import (
 	"context"
 	"net"
+	"sync/atomic"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
@@ -46,6 +47,7 @@ type Weighted struct {
 	tags       []string
 	members    []weightedMember
 	picker     *weightedSWRR
+	lastPicked atomic.Int64
 }
 
 func NewWeighted(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.WeightedOutboundOptions) (adapter.Outbound, error) {
@@ -94,10 +96,17 @@ func (w *Weighted) Network() []string {
 }
 
 // Now and All satisfy adapter.OutboundGroup. Weighted has no single
-// "current" selection since it picks per connection, so Now reports the
-// group's own tag.
+// "current" selection since it picks per connection - Now reports whichever
+// member was picked most recently, purely for display/tracking purposes
+// (e.g. the ClashAPI connection tracker, which walks Now() until it reaches
+// a non-group outbound; returning this group's own tag here would resolve
+// back to itself and loop forever).
 func (w *Weighted) Now() string {
-	return w.Tag()
+	index := int(w.lastPicked.Load())
+	if index < 0 || index >= len(w.tags) {
+		return w.tags[0]
+	}
+	return w.tags[index]
 }
 
 func (w *Weighted) All() []string {
@@ -116,6 +125,7 @@ func (w *Weighted) pick() (weightedMember, error) {
 	if index < 0 || index >= len(w.members) {
 		return weightedMember{}, E.New("no members available")
 	}
+	w.lastPicked.Store(int64(index))
 	return w.members[index], nil
 }
 
