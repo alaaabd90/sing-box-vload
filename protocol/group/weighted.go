@@ -117,6 +117,7 @@ func (w *Weighted) All() []string {
 // in the outbounds option) as available or unavailable, for failover when
 // the underlying network it's bound to drops or recovers.
 func (w *Weighted) UpdateAvailability(index int, available bool) {
+	w.logger.Info("vload: slot ", index, " availability -> ", available)
 	w.picker.SetAvailable(index, available)
 }
 
@@ -126,6 +127,7 @@ func (w *Weighted) pick() (weightedMember, error) {
 		return weightedMember{}, E.New("no members available")
 	}
 	w.lastPicked.Store(int64(index))
+	w.logger.Info("vload: picked slot ", index, " (", w.members[index].tag, ")")
 	return w.members[index], nil
 }
 
