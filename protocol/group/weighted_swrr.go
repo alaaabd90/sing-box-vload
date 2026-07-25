@@ -23,14 +23,20 @@ type weightedSWRR struct {
 }
 
 func newWeightedSWRR(weights []int) *weightedSWRR {
-	avail := make([]bool, len(weights))
-	for i := range avail {
-		avail[i] = true
-	}
+	// Members start unavailable, not available: availability is only ever
+	// flipped by an explicit SetAvailable call from the network-callback
+	// side (see VpnService.kt's onSlotChanged), which only fires on an
+	// available<->unavailable transition. If a member's network was never
+	// up in the first place (e.g. the session is started while Wi-Fi is
+	// already off), no transition ever happens - defaulting to "available"
+	// would let the picker keep routing connections into a network that
+	// never existed, where they'd just fail every time. The all-unavailable
+	// fallback below still covers the brief window before either member's
+	// first onAvailable callback has landed.
 	return &weightedSWRR{
 		weights: weights,
 		current: make([]int, len(weights)),
-		avail:   avail,
+		avail:   make([]bool, len(weights)),
 	}
 }
 

@@ -56,7 +56,10 @@ func TestWeightedSWRRRatio(t *testing.T) {
 
 func TestWeightedSWRRUnavailableSkipped(t *testing.T) {
 	w := newWeightedSWRR([]int{50, 50})
-	w.SetAvailable(1, false)
+	// Members start unavailable by default; member 0 must be explicitly
+	// confirmed available (mirroring a real onAvailable callback) or the
+	// all-unavailable fallback would let member 1 through too.
+	w.SetAvailable(0, true)
 	counts := countPicks(w, 20)
 	if counts[1] != 0 {
 		t.Fatalf("expected member 1 to never be picked while unavailable, got %d picks", counts[1])
@@ -78,7 +81,7 @@ func TestWeightedSWRRAllUnavailableFallsBack(t *testing.T) {
 
 func TestWeightedSWRRRecoveryResetsAccumulators(t *testing.T) {
 	w := newWeightedSWRR([]int{50, 50})
-	w.SetAvailable(1, false)
+	w.SetAvailable(0, true)
 	countPicks(w, 5) // all go to member 0, building up member 0's history
 	w.SetAvailable(1, true)
 	// Immediately after recovery, neither member should have a stale
