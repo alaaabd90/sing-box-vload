@@ -429,6 +429,7 @@ func (t *Inbound) updateRouteAddressSet(it adapter.RuleSet) {
 }
 
 func (t *Inbound) Close() error {
+	t.fixGvisorClose()
 	return common.Close(
 		t.tunStack,
 		t.tunIf,
