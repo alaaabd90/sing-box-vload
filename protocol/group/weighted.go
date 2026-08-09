@@ -2,6 +2,7 @@ package group
 
 import (
 	"context"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -270,11 +271,22 @@ func (w *Weighted) recordResult(index int, err error) {
 // open, falls back to the picker's plain rotation so a connection still
 // gets placed somewhere instead of being refused outright.
 func (w *Weighted) pick() (int, weightedMember, error) {
+	return w.pickExcept(-1)
+}
+
+// pickExcept behaves like pick but never returns member index exclude
+// (pass -1 to consider every member). Used to find a genuinely different
+// second member for a hedge race - racing a member against itself would be
+// pointless.
+func (w *Weighted) pickExcept(exclude int) (int, weightedMember, error) {
 	w.pickMu.Lock()
 	best := -1
 	var bestHeadroom int64
 	tied := 0
 	for i := range w.limiters {
+		if i == exclude {
+			continue
+		}
 		if !w.picker.IsAvailable(i) {
 			continue
 		}
@@ -294,10 +306,16 @@ func (w *Weighted) pick() (int, weightedMember, error) {
 		}
 	}
 	if best == -1 {
-		// Every member is breaker-tripped - fall back to plain rotation
-		// (ignoring headroom entirely) so we keep probing rather than
-		// stalling every new connection outright.
-		best = w.picker.Next()
+		// Every other member is breaker-tripped - fall back to plain
+		// rotation (ignoring headroom entirely) so we keep probing rather
+		// than stalling every new connection outright.
+		fallback := w.picker.Next()
+		if fallback != exclude {
+			best = fallback
+		}
+		// fallback == exclude means the only member the picker could offer
+		// is the one we're specifically avoiding - genuinely nothing else
+		// to try right now, best stays -1.
 	}
 	// Deliberately no hard admission ceiling here even when a member's own
 	// headroom has gone deeply negative (e.g. it's the sole breaker-available
@@ -333,74 +351,179 @@ func (w *Weighted) release(index int) {
 	w.limiters[index].release()
 }
 
+// hedgeDelay bounds how long a hedge race waits on the preferred member
+// before also starting a second attempt on a different member. Short enough
+// that a struggling member's full dial timeout is never on the critical
+// path for a new connection (previously a single bad pick surfaced straight
+// to the caller as a connection error, needing a manual refresh/retry to
+// land on the other, healthy network), while long enough that a normal dial
+// on a healthy member essentially never triggers a second attempt at all.
+const hedgeDelay = 250 * time.Millisecond
+
+type hedgeResult[T io.Closer] struct {
+	index int
+	conn  T
+	err   error
+}
+
+// hedgedPick races dial against the pick()-preferred member and, if that
+// attempt is still outstanding after hedgeDelay or fails outright, against a
+// second, different member in parallel - whichever succeeds first wins. A
+// connection only actually fails once every available member has failed it,
+// not just the one pick() happened to prefer at that instant.
+//
+// A race loser is never counted against its member's health (see
+// abandonHedgeLoser): canceling mid-dial because the other side already won
+// is our choice, not evidence the member is unhealthy.
+func hedgedPick[T io.Closer](w *Weighted, ctx context.Context, dial func(context.Context, adapter.Outbound) (T, error)) (int, T, error) {
+	var zero T
+	primaryIdx, primaryMember, err := w.pick()
+	if err != nil {
+		return -1, zero, err
+	}
+
+	start := func(idx int, member weightedMember) (<-chan hedgeResult[T], context.CancelFunc) {
+		dialCtx, cancel := context.WithCancel(ctx)
+		ch := make(chan hedgeResult[T], 1)
+		go func() {
+			conn, dialErr := dial(dialCtx, member.outbound)
+			ch <- hedgeResult[T]{idx, conn, dialErr}
+		}()
+		return ch, cancel
+	}
+
+	primaryCh, primaryCancel := start(primaryIdx, primaryMember)
+	defer primaryCancel()
+
+	var secondaryCh <-chan hedgeResult[T]
+	var secondaryCancel context.CancelFunc
+	defer func() {
+		if secondaryCancel != nil {
+			secondaryCancel()
+		}
+	}()
+
+	trySecondary := func() {
+		if secondaryCh != nil {
+			return
+		}
+		idx, member, pickErr := w.pickExcept(primaryIdx)
+		if pickErr != nil {
+			return // nothing else available right now; keep waiting on primary
+		}
+		secondaryCh, secondaryCancel = start(idx, member)
+	}
+
+	timer := time.NewTimer(hedgeDelay)
+	defer timer.Stop()
+
+	var primaryFailed, secondaryFailed bool
+	for {
+		select {
+		case res := <-primaryCh:
+			primaryCh = nil
+			w.recordResult(res.index, res.err)
+			if res.err == nil {
+				if secondaryCh != nil {
+					secondaryCancel()
+					abandonHedgeLoser(w, secondaryCh)
+				}
+				return res.index, res.conn, nil
+			}
+			// A genuine failure, not a cancellation - this attempt is done
+			// either way (we're either racing a different secondary or
+			// giving up entirely), so its slot must be freed now rather
+			// than left to a Close() that will never come.
+			w.release(res.index)
+			primaryFailed = true
+			if secondaryFailed {
+				return -1, zero, res.err
+			}
+			trySecondary()
+			if secondaryCh == nil {
+				return -1, zero, res.err
+			}
+		case res := <-secondaryCh:
+			secondaryCh = nil
+			w.recordResult(res.index, res.err)
+			if res.err == nil {
+				primaryCancel()
+				abandonHedgeLoser(w, primaryCh)
+				return res.index, res.conn, nil
+			}
+			w.release(res.index)
+			secondaryFailed = true
+			if primaryFailed {
+				return -1, zero, res.err
+			}
+		case <-timer.C:
+			trySecondary()
+		case <-ctx.Done():
+			primaryCancel()
+			if primaryCh != nil {
+				abandonHedgeLoser(w, primaryCh)
+			}
+			if secondaryCh != nil {
+				secondaryCancel()
+				abandonHedgeLoser(w, secondaryCh)
+			}
+			return -1, zero, ctx.Err()
+		}
+	}
+}
+
+// abandonHedgeLoser waits for a hedge race participant that lost (or that
+// we're giving up on entirely) to actually finish, then releases its
+// concurrency slot and closes it if it turned out to succeed anyway despite
+// no longer being wanted. Deliberately never calls recordResult - see
+// hedgedPick's doc comment.
+func abandonHedgeLoser[T io.Closer](w *Weighted, ch <-chan hedgeResult[T]) {
+	go func() {
+		res := <-ch
+		w.release(res.index)
+		if res.err == nil {
+			res.conn.Close()
+		}
+	}()
+}
+
 func (w *Weighted) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	index, member, err := w.pick()
+	index, conn, err := hedgedPick(w, ctx, func(dialCtx context.Context, ob adapter.Outbound) (net.Conn, error) {
+		return ob.DialContext(dialCtx, network, destination)
+	})
 	if err != nil {
 		return nil, err
-	}
-	conn, dialErr := member.outbound.DialContext(ctx, network, destination)
-	w.recordResult(index, dialErr)
-	if dialErr != nil {
-		w.release(index)
-		return nil, dialErr
 	}
 	return &weightedCountedConn{Conn: conn, release: func() { w.release(index) }}, nil
 }
 
 func (w *Weighted) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	index, member, err := w.pick()
+	index, conn, err := hedgedPick(w, ctx, func(dialCtx context.Context, ob adapter.Outbound) (net.PacketConn, error) {
+		return ob.ListenPacket(dialCtx, destination)
+	})
 	if err != nil {
 		return nil, err
-	}
-	conn, dialErr := member.outbound.ListenPacket(ctx, destination)
-	w.recordResult(index, dialErr)
-	if dialErr != nil {
-		w.release(index)
-		return nil, dialErr
 	}
 	return &weightedCountedPacketConn{PacketConn: conn, release: func() { w.release(index) }}, nil
 }
 
+// NewConnectionEx and NewPacketConnectionEx hand off to the connection
+// manager with the group itself as the dialer, rather than picking a member
+// and delegating to its own NewConnectionEx: that would mean handing the
+// same inbound conn to two members at once to hedge it, which isn't safe
+// (only one side may ever read/write it). Routing through DialContext/
+// ListenPacket instead means real TUN-routed traffic - not just direct
+// DialContext callers - gets the same hedge race. No real vload member
+// (VLESS/VMess/Trojan/Hysteria2/...) implements the ConnectionHandlerEx
+// fast path the old code special-cased, so this changes nothing for any of
+// them; it only affects the same connection setup path they were already
+// going through.
 func (w *Weighted) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
-	index, member, err := w.pick()
-	if err != nil {
-		N.CloseOnHandshakeFailure(conn, onClose, err)
-		w.logger.ErrorContext(ctx, err)
-		return
-	}
-	wrappedClose := func(closeErr error) {
-		w.recordResult(index, closeErr)
-		w.release(index)
-		if onClose != nil {
-			onClose(closeErr)
-		}
-	}
-	if outboundHandler, isHandler := member.outbound.(adapter.ConnectionHandlerEx); isHandler {
-		outboundHandler.NewConnectionEx(ctx, conn, metadata, wrappedClose)
-	} else {
-		w.connection.NewConnection(ctx, member.outbound, conn, metadata, wrappedClose)
-	}
+	w.connection.NewConnection(ctx, w, conn, metadata, onClose)
 }
 
 func (w *Weighted) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
-	index, member, err := w.pick()
-	if err != nil {
-		N.CloseOnHandshakeFailure(conn, onClose, err)
-		w.logger.ErrorContext(ctx, err)
-		return
-	}
-	wrappedClose := func(closeErr error) {
-		w.recordResult(index, closeErr)
-		w.release(index)
-		if onClose != nil {
-			onClose(closeErr)
-		}
-	}
-	if outboundHandler, isHandler := member.outbound.(adapter.PacketConnectionHandlerEx); isHandler {
-		outboundHandler.NewPacketConnectionEx(ctx, conn, metadata, wrappedClose)
-	} else {
-		w.connection.NewPacketConnection(ctx, member.outbound, conn, metadata, wrappedClose)
-	}
+	w.connection.NewPacketConnection(ctx, w, conn, metadata, onClose)
 }
 
 // weightedCountedConn/weightedCountedPacketConn release their member's
