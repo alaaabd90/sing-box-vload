@@ -41,12 +41,26 @@ type WeightedOutboundMember struct {
 }
 
 // WeightedOutboundOptions distributes new connections across its member
-// outbounds by picking, per new connection, whichever member currently has
-// the most spare proven capacity - each member's real concurrency ceiling is
-// discovered live from its own connection outcomes (successes/failures),
-// the same way TCP congestion control discovers a path's usable bandwidth
-// rather than having it configured. No weight or connection-count tuning is
-// required for correct, automatically load-proportional behavior.
+// outbounds. Mode selects how:
+//
+//   - "" / "adaptive" (default): picks, per new connection, whichever member
+//     currently has the most spare proven capacity, and additionally hedges
+//     (races a second member in parallel) if the preferred one hasn't
+//     finished within a short delay or fails outright. Intended for bulk
+//     traffic that should actually use both members' combined throughput
+//     (e.g. a download manager splitting load across two networks).
+//   - "priority": always prefers Outbounds[0] and only ever uses a later
+//     member when an earlier one is circuit-broken (see the package-level
+//     circuit breaker docs); never hedges/races, so traffic doesn't
+//     casually spread across members just because the preferred one was a
+//     little slow this instant. Intended for things that want a single
+//     consistent path with automatic failover rather than combined
+//     throughput - DNS resolution is the motivating case: answers from two
+//     different networks can differ (split-horizon DNS, different
+//     upstream results), so bouncing between them per-query undermines the
+//     "stable browsing" this mode exists for, even though the same two
+//     networks are still fine to combine for raw throughput elsewhere.
 type WeightedOutboundOptions struct {
 	Outbounds []WeightedOutboundMember `json:"outbounds"`
+	Mode      string                   `json:"mode,omitempty"`
 }

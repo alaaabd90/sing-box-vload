@@ -84,6 +84,11 @@ type memberHealth struct {
 // reports "up", since a network can be technically connected but unable to
 // carry real traffic (an overloaded upstream proxy, a throttled link, and
 // so on aren't visible as a link-state change at all).
+// ModePriority is WeightedOutboundOptions.Mode's value for strict-order,
+// failover-only selection - see the option's doc comment for when to use it
+// over the default adaptive/hedged mode.
+const ModePriority = "priority"
+
 type Weighted struct {
 	outbound.Adapter
 	ctx        context.Context
@@ -95,6 +100,7 @@ type Weighted struct {
 	picker     *pccPicker // still used for availability tracking and the all-members-tripped fallback
 	health     []memberHealth
 	limiters   []*adaptiveLimiter
+	priority   bool // true when Mode == ModePriority
 	tieCursor  atomic.Int64
 	// pickMu serializes pick()'s headroom-check-then-acquire as a single
 	// unit. Without it, a burst of concurrent picks (exactly what a
@@ -135,6 +141,7 @@ func NewWeighted(ctx context.Context, router adapter.Router, logger log.ContextL
 		picker:     newPCCPicker(weights),
 		health:     make([]memberHealth, len(tags)),
 		limiters:   limiters,
+		priority:   options.Mode == ModePriority,
 	}, nil
 }
 
@@ -281,27 +288,43 @@ func (w *Weighted) pick() (int, weightedMember, error) {
 func (w *Weighted) pickExcept(exclude int) (int, weightedMember, error) {
 	w.pickMu.Lock()
 	best := -1
-	var bestHeadroom int64
-	tied := 0
-	for i := range w.limiters {
-		if i == exclude {
-			continue
-		}
-		if !w.picker.IsAvailable(i) {
-			continue
-		}
-		h := w.limiters[i].headroom()
-		switch {
-		case best == -1 || h > bestHeadroom:
-			best = i
-			bestHeadroom = h
-			tied = 1
-		case h == bestHeadroom:
-			tied++
-			// Reservoir-style rotation across tied candidates so repeated
-			// ties don't always resolve to the lowest index.
-			if int(w.tieCursor.Add(1))%tied == 0 {
+	if w.priority {
+		// Strict configured order, first available - ignore headroom
+		// entirely. This is what makes priority mode "network 1 unless it's
+		// down": member 0 is always preferred as long as its circuit
+		// breaker hasn't tripped, regardless of how loaded it looks.
+		for i := range w.limiters {
+			if i == exclude {
+				continue
+			}
+			if w.picker.IsAvailable(i) {
 				best = i
+				break
+			}
+		}
+	} else {
+		var bestHeadroom int64
+		tied := 0
+		for i := range w.limiters {
+			if i == exclude {
+				continue
+			}
+			if !w.picker.IsAvailable(i) {
+				continue
+			}
+			h := w.limiters[i].headroom()
+			switch {
+			case best == -1 || h > bestHeadroom:
+				best = i
+				bestHeadroom = h
+				tied = 1
+			case h == bestHeadroom:
+				tied++
+				// Reservoir-style rotation across tied candidates so repeated
+				// ties don't always resolve to the lowest index.
+				if int(w.tieCursor.Add(1))%tied == 0 {
+					best = i
+				}
 			}
 		}
 	}
@@ -414,8 +437,17 @@ func hedgedPick[T io.Closer](w *Weighted, ctx context.Context, dial func(context
 		secondaryCh, secondaryCancel = start(idx, member)
 	}
 
-	timer := time.NewTimer(hedgeDelay)
-	defer timer.Stop()
+	// Priority mode never proactively races a second member just because the
+	// preferred one is taking a moment - that would casually spread traffic
+	// across both members exactly like the mode exists to avoid. timerC
+	// stays nil (never fires in the select below) so failover only ever
+	// triggers on an actual primary failure, further down.
+	var timerC <-chan time.Time
+	if !w.priority {
+		timer := time.NewTimer(hedgeDelay)
+		defer timer.Stop()
+		timerC = timer.C
+	}
 
 	var primaryFailed, secondaryFailed bool
 	for {
@@ -456,7 +488,7 @@ func hedgedPick[T io.Closer](w *Weighted, ctx context.Context, dial func(context
 			if primaryFailed {
 				return -1, zero, res.err
 			}
-		case <-timer.C:
+		case <-timerC:
 			trySecondary()
 		case <-ctx.Done():
 			primaryCancel()
