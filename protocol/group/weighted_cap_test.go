@@ -83,11 +83,36 @@ func TestAdaptiveLimiterGrowsOnSaturatedSuccess(t *testing.T) {
 	if l.limit.Load() != adaptiveInitialLimit {
 		t.Fatalf("expected initial limit %d, got %d", adaptiveInitialLimit, l.limit.Load())
 	}
-	// A success where inFlightAtCompletion == limit proves the member can
-	// sustain one more - the limit should grow.
+	// A single saturated success must not grow the limit on its own - it
+	// takes adaptiveGrowthHoldDown consecutive ones to prove the member can
+	// sustain more, so a burst of near-simultaneous completions can't shove
+	// the ceiling far past what's real before a failure ever gets a chance
+	// to correct it.
+	for i := 0; i < adaptiveGrowthHoldDown-1; i++ {
+		l.onSuccess(int32(adaptiveInitialLimit))
+		if l.limit.Load() != adaptiveInitialLimit {
+			t.Fatalf("expected limit to stay at %d before the hold-down streak completes, got %d", adaptiveInitialLimit, l.limit.Load())
+		}
+	}
 	l.onSuccess(int32(adaptiveInitialLimit))
 	if l.limit.Load() != adaptiveInitialLimit+1 {
-		t.Fatalf("expected limit to grow to %d, got %d", adaptiveInitialLimit+1, l.limit.Load())
+		t.Fatalf("expected limit to grow to %d after %d consecutive saturated successes, got %d", adaptiveInitialLimit+1, adaptiveGrowthHoldDown, l.limit.Load())
+	}
+}
+
+func TestAdaptiveLimiterGrowthStreakResetsOnUnsaturatedSuccessOrFailure(t *testing.T) {
+	l := newAdaptiveLimiter(0)
+	l.onSuccess(int32(adaptiveInitialLimit)) // 1 of adaptiveGrowthHoldDown
+	l.onSuccess(0)                           // unsaturated - resets the streak
+	l.onSuccess(int32(adaptiveInitialLimit)) // back to 1 of adaptiveGrowthHoldDown
+	if l.limit.Load() != adaptiveInitialLimit {
+		t.Fatalf("expected no growth yet, got limit=%d", l.limit.Load())
+	}
+	for i := 0; i < adaptiveGrowthHoldDown-1; i++ {
+		l.onSuccess(int32(adaptiveInitialLimit))
+	}
+	if l.limit.Load() != adaptiveInitialLimit+1 {
+		t.Fatalf("expected the streak to have completed after the reset, got limit=%d", l.limit.Load())
 	}
 }
 

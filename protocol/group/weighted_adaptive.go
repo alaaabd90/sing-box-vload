@@ -23,15 +23,32 @@ import "sync/atomic"
 // failures would trip the breaker outright, so in practice a merely
 // struggling member gets gently starved rather than repeatedly hard-tripped.
 type adaptiveLimiter struct {
-	limit    atomic.Int64
-	inFlight atomic.Int32
-	ceiling  int64 // optional operator-configured cap on how high limit may grow; 0 = none beyond adaptiveMaxLimit
+	limit           atomic.Int64
+	inFlight        atomic.Int32
+	ceiling         int64 // optional operator-configured cap on how high limit may grow; 0 = none beyond adaptiveMaxLimit
+	saturatedStreak atomic.Int32
 }
 
 const (
 	adaptiveInitialLimit = 4   // conservative starting point; grows from here under real load
 	adaptiveMinLimit     = 1   // never throttle a member to zero - it must always get an occasional probe to recover
 	adaptiveMaxLimit     = 256 // safety ceiling against unbounded growth
+	// adaptiveGrowthHoldDown is how many consecutive saturated successes are
+	// required before the limit grows by one, instead of growing on the very
+	// first one. A member's real capacity ceiling is only ever discovered by
+	// overshooting it and causing an actual failure - growing on every single
+	// saturated success let a burst of near-simultaneous completions (a real
+	// download's parallel connections all landing around the same time) push
+	// the limit far past a network's true sustainable concurrency before the
+	// first failure had any chance to correct it. That deep an overshoot then
+	// failed several connections at once, tripping the circuit breaker's full
+	// exclusion instead of the limiter's own gentler halving handling it.
+	// Requiring a short streak of corroborating saturated successes first
+	// slows the climb enough to keep overshoots small, without meaningfully
+	// slowing how fast a member reaches a genuinely high sustainable
+	// capacity - every still-saturated success keeps counting toward the
+	// next step either way.
+	adaptiveGrowthHoldDown = 3
 )
 
 func newAdaptiveLimiter(ceiling int) *adaptiveLimiter {
@@ -68,8 +85,13 @@ func (l *adaptiveLimiter) release() {
 // not just a lightly-loaded member behaving fine.
 func (l *adaptiveLimiter) onSuccess(inFlightAtCompletion int32) {
 	if int64(inFlightAtCompletion) < l.limit.Load() {
+		l.saturatedStreak.Store(0)
 		return
 	}
+	if l.saturatedStreak.Add(1) < adaptiveGrowthHoldDown {
+		return
+	}
+	l.saturatedStreak.Store(0)
 	max := l.effectiveMax()
 	for {
 		cur := l.limit.Load()
@@ -87,6 +109,7 @@ func (l *adaptiveLimiter) onSuccess(inFlightAtCompletion int32) {
 }
 
 func (l *adaptiveLimiter) onFailure() {
+	l.saturatedStreak.Store(0)
 	for {
 		cur := l.limit.Load()
 		next := cur / 2
