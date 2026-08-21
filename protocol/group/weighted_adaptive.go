@@ -30,8 +30,27 @@ type adaptiveLimiter struct {
 }
 
 const (
-	adaptiveInitialLimit = 4   // conservative starting point; grows from here under real load
-	adaptiveMinLimit     = 1   // never throttle a member to zero - it must always get an occasional probe to recover
+	// adaptiveInitialLimit was 4 - tuned around a download manager's
+	// sustained, parallel-segment overshoot scenario. In practice, an
+	// ordinary browser page load doesn't look like that at all: it opens
+	// dozens of short-lived connections across many hosts in one burst,
+	// each closing well before 3 consecutive *saturated* successes (see
+	// adaptiveGrowthHoldDown below) can accumulate to grow the limit even
+	// once. Confirmed live: a real Load Balance session sitting at
+	// inFlight=31 against limit=1-4 for its entire duration (vload log,
+	// "picked slot N ... active=31, limit=1") - i.e. the limiter was
+	// permanently pinned near its floor while genuinely carrying 30+
+	// connections, throttling every pick() decision toward whichever
+	// member's headroom (limit-inFlight) happened to be least negative
+	// rather than actually balancing load, and making Load Balance feel
+	// slow next to a direct profile's unlimited concurrency for no real
+	// capacity reason. Start high enough to cover realistic browser
+	// concurrency from the first connection instead of relying on a ramp
+	// that bursty traffic rarely completes - the halving-on-failure and
+	// circuit breaker below are what actually protect against a member
+	// that can't sustain this, unchanged.
+	adaptiveInitialLimit = 32
+	adaptiveMinLimit     = 1 // never throttle a member to zero - it must always get an occasional probe to recover
 	adaptiveMaxLimit     = 256 // safety ceiling against unbounded growth
 	// adaptiveGrowthHoldDown is how many consecutive saturated successes are
 	// required before the limit grows by one, instead of growing on the very
