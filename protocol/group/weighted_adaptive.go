@@ -72,7 +72,19 @@ const (
 
 func newAdaptiveLimiter(ceiling int) *adaptiveLimiter {
 	l := &adaptiveLimiter{ceiling: int64(ceiling)}
-	l.limit.Store(adaptiveInitialLimit)
+	// effectiveMax() only ever bounded *growth* - an explicit operator
+	// ceiling (vload-windows exposes this per slot; vload-android doesn't
+	// set one at all, so ceiling is always 0 there and this is a no-op)
+	// below adaptiveInitialLimit was silently exceeded from the very first
+	// connection, since the initial Store was never clamped to it. Only
+	// matters once adaptiveInitialLimit is large relative to a real
+	// configured ceiling - harmless at the old value of 4, worth fixing
+	// now that it's 32.
+	initial := int64(adaptiveInitialLimit)
+	if max := l.effectiveMax(); initial > max {
+		initial = max
+	}
+	l.limit.Store(initial)
 	return l
 }
 
