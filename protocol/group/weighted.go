@@ -110,6 +110,16 @@ type Weighted struct {
 	// gap.
 	pickMu     sync.Mutex
 	lastPicked atomic.Int64
+	// memberConns tracks every live connection DialContext/ListenPacket has
+	// handed out for each member, so a platform-side "this slot's physical
+	// network changed" signal (see CloseMember) can close exactly the
+	// connections actually bound to that slot instead of every connection
+	// on the group - vload previously had no way to do this narrower than
+	// a global reset of the whole sing-box instance, which meant a routine
+	// network change affecting only one of the two slots (a cell handover,
+	// Wi-Fi roaming between APs) tore down the *other*, unaffected slot's
+	// perfectly healthy connections too.
+	memberConns []sync.Map
 }
 
 func NewWeighted(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.WeightedOutboundOptions) (adapter.Outbound, error) {
@@ -139,9 +149,10 @@ func NewWeighted(ctx context.Context, router adapter.Router, logger log.ContextL
 		logger:     logger,
 		tags:       tags,
 		picker:     newPCCPicker(weights),
-		health:     make([]memberHealth, len(tags)),
-		limiters:   limiters,
-		priority:   options.Mode == ModePriority,
+		health:      make([]memberHealth, len(tags)),
+		limiters:    limiters,
+		priority:    options.Mode == ModePriority,
+		memberConns: make([]sync.Map, len(tags)),
 	}, nil
 }
 
@@ -526,7 +537,17 @@ func (w *Weighted) DialContext(ctx context.Context, network string, destination 
 	if err != nil {
 		return nil, err
 	}
-	return &weightedCountedConn{Conn: conn, release: func() { w.release(index) }}, nil
+	wrapped := &weightedCountedConn{Conn: conn}
+	wrapped.release = func() {
+		w.release(index)
+		if index >= 0 && index < len(w.memberConns) {
+			w.memberConns[index].Delete(wrapped)
+		}
+	}
+	if index >= 0 && index < len(w.memberConns) {
+		w.memberConns[index].Store(wrapped, struct{}{})
+	}
+	return wrapped, nil
 }
 
 func (w *Weighted) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
@@ -536,7 +557,40 @@ func (w *Weighted) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	if err != nil {
 		return nil, err
 	}
-	return &weightedCountedPacketConn{PacketConn: conn, release: func() { w.release(index) }}, nil
+	wrapped := &weightedCountedPacketConn{PacketConn: conn}
+	wrapped.release = func() {
+		w.release(index)
+		if index >= 0 && index < len(w.memberConns) {
+			w.memberConns[index].Delete(wrapped)
+		}
+	}
+	if index >= 0 && index < len(w.memberConns) {
+		w.memberConns[index].Store(wrapped, struct{}{})
+	}
+	return wrapped, nil
+}
+
+// CloseMember force-closes every connection currently tracked for member
+// index (0-based, matching the order given in the outbounds option) and
+// returns how many it closed. For a platform-side "this slot's physical
+// network changed" signal - the connections were dialed on the interface
+// that's now gone (or replaced), so closing them lets whatever was using
+// them fail fast and retry through pick() (see UpdateAvailability) instead
+// of hanging on a socket that will never produce another byte - without
+// touching anything on the other, unaffected member.
+func (w *Weighted) CloseMember(index int) int {
+	if index < 0 || index >= len(w.memberConns) {
+		return 0
+	}
+	closed := 0
+	w.memberConns[index].Range(func(key, _ any) bool {
+		if closer, ok := key.(io.Closer); ok {
+			closer.Close()
+			closed++
+		}
+		return true
+	})
+	return closed
 }
 
 // NewConnectionEx and NewPacketConnectionEx hand off to the connection
