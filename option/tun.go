@@ -44,6 +44,19 @@ type TunInboundOptions struct {
 	Platform                      *TunPlatformOptions              `json:"platform,omitempty"`
 	InboundOptions
 
+	// WindowsTapAdapter is a vload-only addition: on Windows, back this
+	// inbound with a real TAP-Windows (tap-windows6/OpenVPN driver) NDIS
+	// adapter instead of WinTun. WinTun is a pure Layer-3, driver-only
+	// virtual adapter with no real Ethernet-adapter semantics - Windows'
+	// own Internet Connection Sharing / Mobile Hotspot has a long-
+	// standing history of refusing to share a WinTun-backed connection
+	// (or working unreliably when it does), since ICS's shared-
+	// connection detection was built around real NDIS adapters.
+	// TAP-Windows presents as exactly that, letting a hotspot share the
+	// tunnel with other client devices. No effect on non-Windows
+	// platforms. See protocol/tun/tap_windows_hook.go.
+	WindowsTapAdapter bool `json:"windows_tap_adapter,omitempty"`
+
 	// Deprecated: removed
 	GSO bool `json:"gso,omitempty"`
 	// Deprecated: merged to Address

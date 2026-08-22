@@ -54,6 +54,7 @@ type Inbound struct {
 	routeExcludeRuleSetCallback []*list.Element[adapter.RuleSetUpdateCallback]
 	routeAddressSet             []*netipx.IPSet
 	routeExcludeAddressSet      []*netipx.IPSet
+	windowsTapAdapter           bool
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TunInboundOptions) (adapter.Inbound, error) {
@@ -205,6 +206,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		stack:             options.Stack,
 		platformInterface: platformInterface,
 		platformOptions:   common.PtrValueOrDefault(options.Platform),
+		windowsTapAdapter: options.WindowsTapAdapter,
 	}
 	for _, routeAddressSet := range options.RouteAddressSet {
 		ruleSet, loaded := router.RuleSet(routeAddressSet)
@@ -353,6 +355,8 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
 		monitor.Start("open interface")
 		if t.platformInterface != nil && t.platformInterface.UsePlatformInterface() {
 			tunInterface, err = t.platformInterface.OpenInterface(&tunOptions, t.platformOptions)
+		} else if runtime.GOOS == "windows" && t.windowsTapAdapter && HookWindowsTapAdapter != nil {
+			tunInterface, err = HookWindowsTapAdapter(tunOptions)
 		} else {
 			if HookBeforeCreatePlatformInterface != nil {
 				HookBeforeCreatePlatformInterface()
