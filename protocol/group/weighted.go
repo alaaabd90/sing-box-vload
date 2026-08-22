@@ -121,7 +121,35 @@ type Weighted struct {
 	// Wi-Fi roaming between APs) tore down the *other*, unaffected slot's
 	// perfectly healthy connections too.
 	memberConns []sync.Map
+	// hedgeLossStreak/hedgeSuppressedUntil let a member whose hedge races
+	// are essentially always lost - not failed, just consistently slower
+	// than whichever other member keeps winning for the same destination -
+	// stop paying the cost of that race on every single new connection.
+	// Racing a doomed primary still dials the secondary all the way
+	// through to the same remote destination, so every connection through
+	// this group was silently doubling the connection rate an origin
+	// server saw. Confirmed live: a download target that answered a single
+	// probe request normally (206) started returning 403 once a 30+
+	// thread download - doubled by this hedging on every request - hit
+	// it, consistent with the origin's own abuse/rate-limit protection
+	// reacting to the burst. Suppression is time-bounded (see
+	// hedgeSuppressionCooldown), not permanent, so a member that
+	// genuinely recovers gets re-probed rather than staying penalized
+	// forever. Scoped to only the speculative, timer-fired hedge (see
+	// hedgedPick) - a primary that actually fails outright still hedges
+	// unconditionally for correctness, this only trims the "just in case
+	// it's slow" probe.
+	hedgeLossStreak      []atomic.Int32
+	hedgeSuppressedUntil []atomic.Int64 // unix nano; 0 = never suppressed
 }
+
+// hedgeLossStreakThreshold consecutive lost hedge races (the timer fired
+// and the *other* member's dial won) before a member's hedge gets
+// suppressed for hedgeSuppressionCooldown.
+const (
+	hedgeLossStreakThreshold = 8
+	hedgeSuppressionCooldown = 30 * time.Second
+)
 
 func NewWeighted(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.WeightedOutboundOptions) (adapter.Outbound, error) {
 	if len(options.Outbounds) < 2 {
@@ -143,17 +171,19 @@ func NewWeighted(ctx context.Context, router adapter.Router, logger log.ContextL
 		limiters[i] = newAdaptiveLimiter(int(member.MaxConnections))
 	}
 	return &Weighted{
-		Adapter:    outbound.NewAdapter(C.TypeWeighted, tag, nil, tags),
-		ctx:        ctx,
-		outboundMg: service.FromContext[adapter.OutboundManager](ctx),
-		connection: service.FromContext[adapter.ConnectionManager](ctx),
-		logger:     logger,
-		tags:       tags,
-		picker:     newPCCPicker(weights),
-		health:      make([]memberHealth, len(tags)),
-		limiters:    limiters,
-		priority:    options.Mode == ModePriority,
-		memberConns: make([]sync.Map, len(tags)),
+		Adapter:              outbound.NewAdapter(C.TypeWeighted, tag, nil, tags),
+		ctx:                  ctx,
+		outboundMg:           service.FromContext[adapter.OutboundManager](ctx),
+		connection:           service.FromContext[adapter.ConnectionManager](ctx),
+		logger:               logger,
+		tags:                 tags,
+		picker:               newPCCPicker(weights),
+		health:               make([]memberHealth, len(tags)),
+		limiters:             limiters,
+		priority:             options.Mode == ModePriority,
+		memberConns:          make([]sync.Map, len(tags)),
+		hedgeLossStreak:      make([]atomic.Int32, len(tags)),
+		hedgeSuppressedUntil: make([]atomic.Int64, len(tags)),
 	}, nil
 }
 
@@ -386,6 +416,42 @@ func (w *Weighted) release(index int) {
 	w.limiters[index].release()
 }
 
+// recordHedgeOutcome feeds one hedge race's result into primaryIdx's loss
+// streak: primaryWon resets it (this member just proved it can still win,
+// or at least isn't the one losing right now), primaryWon==false means the
+// timer-fired speculative hedge actually mattered - the other member's
+// dial beat this member's - and increments it. Crossing
+// hedgeLossStreakThreshold suppresses this member's speculative hedge for
+// hedgeSuppressionCooldown; see hedgeSuppressed and the Weighted struct's
+// doc comment for why.
+func (w *Weighted) recordHedgeOutcome(primaryIdx int, primaryWon bool) {
+	if primaryIdx < 0 || primaryIdx >= len(w.hedgeLossStreak) {
+		return
+	}
+	if primaryWon {
+		w.hedgeLossStreak[primaryIdx].Store(0)
+		return
+	}
+	streak := w.hedgeLossStreak[primaryIdx].Add(1)
+	if streak == hedgeLossStreakThreshold {
+		until := time.Now().Add(hedgeSuppressionCooldown).UnixNano()
+		w.hedgeSuppressedUntil[primaryIdx].Store(until)
+		w.logger.Info("vload: slot ", primaryIdx, " hedge suppressed for ", hedgeSuppressionCooldown,
+			" after ", streak, " consecutive lost hedge races (avoids doubling connection attempts against a target that's already slower on this path)")
+	}
+}
+
+// hedgeSuppressed reports whether idx's speculative hedge is currently
+// suppressed - i.e. whether the timer-fired branch in hedgedPick should
+// skip racing a second member rather than always doing so.
+func (w *Weighted) hedgeSuppressed(idx int) bool {
+	if idx < 0 || idx >= len(w.hedgeSuppressedUntil) {
+		return false
+	}
+	until := w.hedgeSuppressedUntil[idx].Load()
+	return until != 0 && time.Now().UnixNano() < until
+}
+
 // hedgeDelay bounds how long a hedge race waits on the preferred member
 // before also starting a second attempt on a different member. Short enough
 // that a struggling member's full dial timeout is never on the critical
@@ -468,6 +534,7 @@ func hedgedPick[T io.Closer](w *Weighted, ctx context.Context, dial func(context
 			primaryCh = nil
 			w.recordResult(res.index, res.err)
 			if res.err == nil {
+				w.recordHedgeOutcome(primaryIdx, true)
 				if secondaryCh != nil {
 					secondaryCancel()
 					abandonHedgeLoser(w, secondaryCh)
@@ -491,6 +558,17 @@ func hedgedPick[T io.Closer](w *Weighted, ctx context.Context, dial func(context
 			secondaryCh = nil
 			w.recordResult(res.index, res.err)
 			if res.err == nil {
+				// The secondary won a race the primary was still in when
+				// this fired - i.e. hedging actually mattered here, not
+				// just a formality. Only counts against primaryIdx if it
+				// hasn't already failed outright (primaryFailed): that
+				// path already means the timer-fired speculative hedge
+				// never applies, since trySecondary there runs
+				// unconditionally for correctness - see hedgeSuppressed's
+				// doc comment.
+				if !primaryFailed {
+					w.recordHedgeOutcome(primaryIdx, false)
+				}
 				primaryCancel()
 				abandonHedgeLoser(w, primaryCh)
 				return res.index, res.conn, nil
@@ -501,7 +579,17 @@ func hedgedPick[T io.Closer](w *Weighted, ctx context.Context, dial func(context
 				return -1, zero, res.err
 			}
 		case <-timerC:
-			trySecondary()
+			// Only the speculative "primary might just be slow" hedge is
+			// gated - a primary that genuinely fails still hedges
+			// unconditionally via the primaryFailed branch above,
+			// regardless of suppression. See hedgeSuppressed's doc
+			// comment for why: this member has been losing this race
+			// on essentially every connection lately, so racing it
+			// again here would just double the connection rate an
+			// origin server sees for no real benefit.
+			if !w.hedgeSuppressed(primaryIdx) {
+				trySecondary()
+			}
 		case <-ctx.Done():
 			primaryCancel()
 			if primaryCh != nil {
