@@ -13,6 +13,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -557,7 +558,9 @@ func (w *Weighted) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	if err != nil {
 		return nil, err
 	}
-	wrapped := &weightedCountedPacketConn{PacketConn: conn}
+	// bufio.NewPacketConn normalizes conn to N.NetPacketConn *before* it gets
+	// embedded below - see the type's doc comment for why this matters.
+	wrapped := &weightedCountedPacketConn{NetPacketConn: bufio.NewPacketConn(conn)}
 	wrapped.release = func() {
 		w.release(index)
 		if index >= 0 && index < len(w.memberConns) {
@@ -630,14 +633,34 @@ func (c *weightedCountedConn) Close() error {
 	return err
 }
 
+func (c *weightedCountedConn) Upstream() any {
+	return c.Conn
+}
+
+// weightedCountedPacketConn embeds N.NetPacketConn, not net.PacketConn: the
+// member's real conn (e.g. a VLESS mux packet conn) implements the wider
+// N.NetPacketConn interface, with a WritePacket(buffer, M.Socksaddr) that
+// can carry a domain destination end-to-end. Embedding the narrower
+// net.PacketConn only promotes WriteTo(p, net.Addr), and downstream
+// consumers (bufio.NewPacketConn's `conn.(N.NetPacketConn)` check) test the
+// *wrapper's* method set, not the underlying conn's - so with the narrow
+// embed the assertion always failed and every write silently fell back to
+// destination.UDPAddr(), which can't represent a domain. Under fake-ip
+// (every non-literal destination is a domain until the outbound resolves
+// it) that broke all UDP - BitTorrent trackers/DHT included - through this
+// group, while TCP was unaffected since it doesn't re-address per packet.
 type weightedCountedPacketConn struct {
-	net.PacketConn
+	N.NetPacketConn
 	once    sync.Once
 	release func()
 }
 
 func (c *weightedCountedPacketConn) Close() error {
-	err := c.PacketConn.Close()
+	err := c.NetPacketConn.Close()
 	c.once.Do(c.release)
 	return err
+}
+
+func (c *weightedCountedPacketConn) Upstream() any {
+	return c.NetPacketConn
 }
