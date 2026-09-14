@@ -2,6 +2,8 @@ package boxapi
 
 import (
 	"context"
+	"fmt"
+	"log"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -14,6 +16,22 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	N "github.com/sagernet/sing/common/network"
 )
+
+// vload: surfaces every connection routed to the "direct" outbound in the
+// app's own log viewer/logcat (stdlib log is redirected there by
+// libneko/neko_log), tagged distinctly from normal sing-box routing logs.
+// Requested for on-device testing so a connection that silently falls back
+// to direct (e.g. a new protocol's outbound failing to build/connect) is
+// visible immediately instead of looking like a working proxied connection.
+func logIfDirect(inbound string, outbound string, destination fmt.Stringer, kind string) {
+	if outbound != "direct" {
+		return
+	}
+	log.Printf(
+		"[Debug] [vload-direct-check] %s connection went DIRECT (not through proxy): inbound=%s destination=%s",
+		kind, inbound, destination.String(),
+	)
+}
 
 type SbStatsService struct {
 	createdAt time.Time
@@ -53,6 +71,7 @@ func (s *SbStatsService) RoutedConnection(ctx context.Context, conn net.Conn, me
 	inbound := metadata.Inbound
 	user := metadata.User
 	outbound := matchOutbound.Tag()
+	logIfDirect(inbound, outbound, metadata.Destination, "TCP")
 	return s.RoutedConnectionInternal(inbound, outbound, user, conn, true)
 }
 
@@ -91,6 +110,7 @@ func (s *SbStatsService) RoutedPacketConnection(ctx context.Context, conn N.Pack
 	inbound := metadata.Inbound
 	user := metadata.User
 	outbound := matchOutbound.Tag()
+	logIfDirect(inbound, outbound, metadata.Destination, "UDP")
 	var readCounter []*atomic.Int64
 	var writeCounter []*atomic.Int64
 	countInbound := inbound != "" && s.inbounds[inbound]
