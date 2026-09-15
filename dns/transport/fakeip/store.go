@@ -139,10 +139,19 @@ func (s *Store) Create(domain string, isIPv6 bool) (netip.Addr, error) {
 		s.inet6Current = nextAddress
 		address = nextAddress
 	}
-	err := s.storage.FakeIPStore(address, domain)
-	if err != nil {
-		s.logger.Warn("save FakeIP cache: ", err)
-	}
+	// vload: this used to call the synchronous FakeIPStore, which for a
+	// disk-backed CacheFile does a blocking bbolt Batch write (fsync,
+	// coalesced with up to ~10ms of artificial delay) right here in the DNS
+	// resolution hot path - once per newly-seen domain. A single page load
+	// can resolve dozens of new third-party domains (ads, CDNs, fonts,
+	// analytics), each one serializing a disk write into page-load time.
+	// FakeIPStoreAsync already exists for exactly this: it records the
+	// pending write in an in-memory shadow map (so FakeIPLoad/
+	// FakeIPLoadDomain still resolve it correctly before the flush lands)
+	// and persists in the background. MemoryStorage's FakeIPStoreAsync is
+	// just a direct synchronous call, so this is a no-op behavior change
+	// when cache_file/store_fakeip is off.
+	s.storage.FakeIPStoreAsync(address, domain, s.logger)
 	s.storage.FakeIPSaveMetadataAsync(&adapter.FakeIPMetadata{
 		Inet4Range:   s.inet4Range,
 		Inet6Range:   s.inet6Range,

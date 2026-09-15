@@ -587,7 +587,23 @@ func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.Inb
 			metadata.FakeIP = true
 			r.logger.DebugContext(ctx, "found fakeip domain: ", domain)
 		} else if !loaded {
-			r.logger.DebugContext(ctx, "missing fakeip record for ", metadata.Destination.Addr, ", routing by IP instead of domain")
+			// vload: routing by the raw fake IP here (the previous version of
+			// this fix) doesn't actually keep the connection alive the way it
+			// sounds - a fake IP is never a real, dialable address, so
+			// whichever outbound gets picked can only ever fail trying to
+			// reach it. Confirmed on-device: it still fails every time, just
+			// slower and worse - the raw fake IP got dialed all the way
+			// through the proxy tunnel to the remote server, which then
+			// failed with "network is unreachable" 94ms-1.2s later, instead
+			// of failing locally and instantly like this does. matchRule's
+			// callers only ever fail *this one* connection attempt either
+			// way (verified by reading every caller), so there is no
+			// broader benefit being given up here - only the wasted,
+			// user-visible round trip. The genuine value of the original fix
+			// (see the comment above) was accepting a miss gracefully rather
+			// than treating it as some larger router-level failure; failing
+			// this single connection fast still does that.
+			return E.New("missing fakeip record for ", metadata.Destination.Addr, ", try enable `experimental.cache_file`")
 		}
 	} else if metadata.Domain == "" {
 		domain, loaded := r.dns.LookupReverseMapping(metadata.Destination.Addr)
