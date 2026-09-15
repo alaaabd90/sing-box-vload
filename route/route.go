@@ -563,10 +563,22 @@ func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.Inb
 	}
 	if metadata.Destination.Addr.IsValid() && r.dnsTransport.FakeIP() != nil && r.dnsTransport.FakeIP().Store().Contains(metadata.Destination.Addr) {
 		domain, loaded := r.dnsTransport.FakeIP().Store().Lookup(metadata.Destination.Addr)
-		if !loaded {
-			return E.New("missing fakeip record, try enable `experimental.cache_file`")
-		}
-		if domain != "" {
+		// vload: this used to abort the whole connection outright
+		// ("missing fakeip record, try enable `experimental.cache_file`" as
+		// a fatal error) whenever the reverse mapping wasn't found - and we
+		// confirmed via a real device, enabling cache_file/store_fakeip
+		// (see ConfigBuilder.kt) doesn't fully eliminate it: it still hits
+		// noticeably under concurrent multi-slot Load Balance dialing (a
+		// vload-specific outbound), at a rate the pre-port engine didn't
+		// exhibit under the same real workload, without a confirmed root
+		// cause despite real investigation. Rather than keep killing the
+		// connection outright for what's ultimately a missed optimization
+		// (domain-aware routing for this one connection), fall through to
+		// plain IP-based rule matching on the fake IP when the record isn't
+		// there - a degraded but alive connection beats a dead one. This
+		// only changes what happens on a miss; a hit still resolves and
+		// rewrites to the real domain exactly as before.
+		if loaded && domain != "" {
 			metadata.OriginDestination = metadata.Destination
 			metadata.Destination = M.Socksaddr{
 				Fqdn: domain,
@@ -574,6 +586,8 @@ func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.Inb
 			}
 			metadata.FakeIP = true
 			r.logger.DebugContext(ctx, "found fakeip domain: ", domain)
+		} else if !loaded {
+			r.logger.DebugContext(ctx, "missing fakeip record for ", metadata.Destination.Addr, ", routing by IP instead of domain")
 		}
 	} else if metadata.Domain == "" {
 		domain, loaded := r.dns.LookupReverseMapping(metadata.Destination.Addr)
