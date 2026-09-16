@@ -2,7 +2,6 @@ package v2rayquic
 
 import (
 	"net"
-	"sync"
 	"time"
 
 	"github.com/sagernet/quic-go"
@@ -12,8 +11,6 @@ import (
 type StreamWrapper struct {
 	Conn *quic.Conn
 	*quic.Stream
-	closeOnce sync.Once
-	onClose   func()
 }
 
 func (s *StreamWrapper) Read(p []byte) (n int, err error) {
@@ -44,8 +41,5 @@ func (s *StreamWrapper) Close() error {
 	// quic-go's Stream.Close does not unblock a Write blocked on flow control,
 	// but a past write deadline does; buffered data and the FIN are unaffected.
 	s.Stream.SetWriteDeadline(time.Now())
-	if s.onClose != nil {
-		s.closeOnce.Do(s.onClose)
-	}
 	return nil
 }

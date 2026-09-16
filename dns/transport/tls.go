@@ -20,10 +20,7 @@ import (
 	mDNS "github.com/miekg/dns"
 )
 
-var (
-	_ adapter.DNSTransport         = (*TLSTransport)(nil)
-	_ adapter.IdleConnectionKeeper = (*TLSTransport)(nil)
-)
+var _ adapter.DNSTransport = (*TLSTransport)(nil)
 
 func RegisterTLS(registry *dns.TransportRegistry) {
 	dns.RegisterTransport[option.RemoteTLSDNSServerOptions](registry, C.DNSTypeTLS, NewTLS)
@@ -98,14 +95,6 @@ func (t *TLSTransport) Close() error {
 
 func (t *TLSTransport) Reset() {
 	t.multiplexer.Reset()
-}
-
-func (t *TLSTransport) SetKeepIdleConnections(keep bool) {
-	t.multiplexer.SetKeepIdleConnections(keep)
-}
-
-func (t *TLSTransport) CloseIdleConnections() {
-	t.multiplexer.CloseIdleConnections()
 }
 
 func (t *TLSTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {

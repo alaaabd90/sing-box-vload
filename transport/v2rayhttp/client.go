@@ -8,13 +8,11 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -23,19 +21,18 @@ import (
 	"golang.org/x/net/http2"
 )
 
-var _ adapter.V2RayMultiplexClientTransport = (*Client)(nil)
+var _ adapter.V2RayClientTransport = (*Client)(nil)
 
 type Client struct {
 	ctx        context.Context
 	dialer     N.Dialer
 	serverAddr M.Socksaddr
-	transport  common.TypedValue[http.RoundTripper]
+	transport  http.RoundTripper
 	http2      bool
 	requestURL url.URL
 	host       []string
 	method     string
 	headers    http.Header
-	closeIdle  atomic.Bool
 }
 
 func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, options option.V2RayHTTPOptions, tlsConfig tls.Config) (adapter.V2RayClientTransport, error) {
@@ -77,7 +74,7 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	if !strings.HasPrefix(requestURL.Path, "/") {
 		requestURL.Path = "/" + requestURL.Path
 	}
-	client := &Client{
+	return &Client{
 		ctx:        ctx,
 		dialer:     dialer,
 		serverAddr: serverAddr,
@@ -85,10 +82,9 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 		host:       options.Host,
 		method:     options.Method,
 		headers:    options.Headers.Build(),
+		transport:  transport,
 		http2:      tlsConfig != nil,
-	}
-	client.transport.Store(transport)
-	return client, nil
+	}, nil
 }
 
 func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
@@ -141,14 +137,8 @@ func (c *Client) dialHTTP2(ctx context.Context) (net.Conn, error) {
 		request.Host = c.host[rand.Intn(hostLen)]
 	}
 	conn := NewLateHTTPConn(pipeInWriter)
-	keepSession := adapter.KeepSessionFromContext(ctx)
-	conn.onClose = func() {
-		if c.closeIdle.Load() && !keepSession {
-			CloseIdleConnections(c.transport.Load())
-		}
-	}
 	go func() {
-		response, err := c.transport.Load().RoundTrip(request)
+		response, err := c.transport.RoundTrip(request)
 		if err != nil {
 			conn.Setup(nil, err)
 		} else if response.StatusCode != 200 {
@@ -161,22 +151,7 @@ func (c *Client) dialHTTP2(ctx context.Context) (net.Conn, error) {
 	return conn, nil
 }
 
-func (c *Client) MultiplexEnabled() bool {
-	return c.http2
-}
-
-func (c *Client) SetKeepIdleConnections(keep bool) {
-	c.closeIdle.Store(!keep)
-	if !keep {
-		c.CloseIdleConnections()
-	}
-}
-
-func (c *Client) CloseIdleConnections() {
-	CloseIdleConnections(c.transport.Load())
-}
-
 func (c *Client) Close() error {
-	c.transport.Store(ResetTransport(c.transport.Load()))
+	c.transport = ResetTransport(c.transport)
 	return nil
 }

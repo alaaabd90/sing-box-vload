@@ -6,7 +6,6 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/sagernet/sing-box/common/ipset"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/schema"
 	"github.com/sagernet/sing/common"
@@ -16,6 +15,8 @@ import (
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badjson"
 	"github.com/sagernet/sing/common/json/badoption"
+
+	"go4.org/netipx"
 )
 
 type _RuleSet struct {
@@ -276,8 +277,8 @@ type DefaultHeadlessRule struct {
 	Invert bool `json:"invert,omitempty"`
 
 	DomainMatcher *domain.Matcher `json:"-"`
-	SourceIPSet   *ipset.Set      `json:"-"`
-	IPSet         *ipset.Set      `json:"-"`
+	SourceIPSet   *netipx.IPSet   `json:"-"`
+	IPSet         *netipx.IPSet   `json:"-"`
 
 	AdGuardDomain        badoption.Listable[string] `json:"-"`
 	AdGuardDomainMatcher *domain.AdGuardMatcher     `json:"-"`

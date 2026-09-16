@@ -8,7 +8,6 @@ type TransportAdapter struct {
 	transportType string
 	transportTag  string
 	dependencies  []string
-	references    []string
 }
 
 func NewTransportAdapter(transportType string, transportTag string, dependencies []string) TransportAdapter {
@@ -24,15 +23,10 @@ func NewTransportAdapterWithLocalOptions(transportType string, transportTag stri
 	if localOptions.DomainResolver != nil && localOptions.DomainResolver.Server != "" {
 		dependencies = append(dependencies, localOptions.DomainResolver.Server)
 	}
-	var references []string
-	if localOptions.Detour != "" {
-		references = []string{localOptions.Detour}
-	}
 	return TransportAdapter{
 		transportType: transportType,
 		transportTag:  transportTag,
 		dependencies:  dependencies,
-		references:    references,
 	}
 }
 
@@ -41,15 +35,10 @@ func NewTransportAdapterWithRemoteOptions(transportType string, transportTag str
 	if remoteOptions.DomainResolver != nil && remoteOptions.DomainResolver.Server != "" {
 		dependencies = append(dependencies, remoteOptions.DomainResolver.Server)
 	}
-	var references []string
-	if remoteOptions.Detour != "" {
-		references = []string{remoteOptions.Detour}
-	}
 	return TransportAdapter{
 		transportType: transportType,
 		transportTag:  transportTag,
 		dependencies:  dependencies,
-		references:    references,
 	}
 }
 
@@ -63,8 +52,4 @@ func (a *TransportAdapter) Tag() string {
 
 func (a *TransportAdapter) Dependencies() []string {
 	return a.dependencies
-}
-
-func (a *TransportAdapter) References() []string {
-	return a.references
 }

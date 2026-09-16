@@ -48,10 +48,6 @@ func archiveCrashReport(path string, crashReportsDir string) {
 		reportMetadata: baseReportMetadata(),
 		CrashedAt:      crashTime.Format(time.RFC3339),
 	}
-	platformSnapshot := readPlatformSnapshot()
-	if platformSnapshot != nil {
-		metadata.Platform = platformSnapshot
-	}
 	writeReportMetadata(destPath, metadata)
 	os.Remove(path)
 	copyConfigSnapshot(destPath)

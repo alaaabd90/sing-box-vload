@@ -60,7 +60,7 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 
 	var (
 		dialer                 net.Dialer
-		listenConfig           net.ListenConfig
+		listener               net.ListenConfig
 		interfaceFinder        control.InterfaceFinder
 		networkStrategy        *C.NetworkStrategy
 		defaultNetworkStrategy bool
@@ -74,23 +74,20 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 	} else {
 		interfaceFinder = control.NewDefaultInterfaceFinder()
 	}
-	socketBufferFunc := control.UDPSocketBuffer(listener.UDPSocketBufferSize())
-	dialer.Control = control.Append(dialer.Control, socketBufferFunc)
-	listenConfig.Control = control.Append(listenConfig.Control, socketBufferFunc)
 	if options.BindInterface != "" {
 		if !(C.IsLinux || C.IsDarwin || C.IsWindows) {
 			return nil, E.New("`bind_interface` is only supported on Linux, macOS and Windows")
 		}
 		bindFunc := control.BindToInterface(interfaceFinder, options.BindInterface, -1)
 		dialer.Control = control.Append(dialer.Control, bindFunc)
-		listenConfig.Control = control.Append(listenConfig.Control, bindFunc)
+		listener.Control = control.Append(listener.Control, bindFunc)
 	}
 	if options.RoutingMark > 0 {
 		if !C.IsLinux {
 			return nil, E.New("`routing_mark` is only supported on Linux")
 		}
 		dialer.Control = control.Append(dialer.Control, setMarkWrapper(networkManager, uint32(options.RoutingMark), false))
-		listenConfig.Control = control.Append(listenConfig.Control, setMarkWrapper(networkManager, uint32(options.RoutingMark), false))
+		listener.Control = control.Append(listener.Control, setMarkWrapper(networkManager, uint32(options.RoutingMark), false))
 	}
 	disableDefaultBind := options.BindInterface != "" || options.Inet4BindAddress != nil || options.Inet6BindAddress != nil
 	if disableDefaultBind || options.TCPFastOpen {
@@ -104,7 +101,7 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 		if defaultOptions.BindInterface != "" && !disableDefaultBind {
 			bindFunc := control.BindToInterface(networkManager.InterfaceFinder(), defaultOptions.BindInterface, -1)
 			dialer.Control = control.Append(dialer.Control, bindFunc)
-			listenConfig.Control = control.Append(listenConfig.Control, bindFunc)
+			listener.Control = control.Append(listener.Control, bindFunc)
 		} else if networkManager.AutoDetectInterface() && !disableDefaultBind {
 			if platformInterface != nil && platformInterface.UsePlatformNetworkInterfaces() {
 				networkStrategy = (*C.NetworkStrategy)(options.NetworkStrategy)
@@ -125,7 +122,7 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 				}
 				bindFunc := networkManager.ProtectFunc()
 				dialer.Control = control.Append(dialer.Control, bindFunc)
-				listenConfig.Control = control.Append(listenConfig.Control, bindFunc)
+				listener.Control = control.Append(listener.Control, bindFunc)
 			} else {
 				bindFunc := networkManager.AutoDetectInterfaceFunc()
 				dialer.Control = control.Append(dialer.Control, bindFunc)
@@ -134,20 +131,20 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 		}
 		if options.RoutingMark == 0 && defaultOptions.RoutingMark != 0 {
 			dialer.Control = control.Append(dialer.Control, setMarkWrapper(networkManager, defaultOptions.RoutingMark, true))
-			listenConfig.Control = control.Append(listenConfig.Control, setMarkWrapper(networkManager, defaultOptions.RoutingMark, true))
+			listener.Control = control.Append(listener.Control, setMarkWrapper(networkManager, defaultOptions.RoutingMark, true))
 		}
 	}
 	if networkManager != nil {
 		markFunc := networkManager.AutoRedirectOutputMarkFunc()
 		dialer.Control = control.Append(dialer.Control, markFunc)
-		listenConfig.Control = control.Append(listenConfig.Control, markFunc)
+		listener.Control = control.Append(listener.Control, markFunc)
 	}
 	if options.ReuseAddr {
-		listenConfig.Control = control.Append(listenConfig.Control, control.ReuseAddr())
+		listener.Control = control.Append(listener.Control, control.ReuseAddr())
 	}
 	if options.ProtectPath != "" {
 		dialer.Control = control.Append(dialer.Control, control.ProtectPath(options.ProtectPath))
-		listenConfig.Control = control.Append(listenConfig.Control, control.ProtectPath(options.ProtectPath))
+		listener.Control = control.Append(listener.Control, control.ProtectPath(options.ProtectPath))
 	}
 	if options.BindAddressNoPort {
 		if !C.IsLinux {
@@ -193,7 +190,7 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 	}
 	if !udpFragment {
 		dialer.Control = control.Append(dialer.Control, control.DisableUDPFragment())
-		listenConfig.Control = control.Append(listenConfig.Control, control.DisableUDPFragment())
+		listener.Control = control.Append(listener.Control, control.DisableUDPFragment())
 	}
 	var (
 		dialer4    = dialer
@@ -233,7 +230,7 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 		dialer6:                tcpDialer6,
 		udpDialer4:             udpDialer4,
 		udpDialer6:             udpDialer6,
-		udpListener:            listenConfig,
+		udpListener:            listener,
 		udpAddr4:               udpAddr4,
 		udpAddr6:               udpAddr6,
 		netns:                  options.NetNs,
@@ -431,17 +428,9 @@ func (d *DefaultDialer) trackConn(ctx context.Context, destination M.Socksaddr, 
 		if recorder != nil {
 			recorder.CountConnectionOpened()
 			attribution := d.dialAttribution(ctx, destination)
-			outboundCounter := recorder.TrafficCounter(powerreport.TrafficOutbound, attribution.Outbound)
-			dnsCounter := recorder.TrafficCounter(powerreport.TrafficDNSTransport, attribution.DNS)
-			outboundCounter.CountDial()
-			dnsCounter.CountDial()
 			conn = bufio.NewCounterConn(conn, []N.CountFunc{func(n int64) {
-				outboundCounter.CountIn(n)
-				dnsCounter.CountIn(n)
 				recorder.Touch(powerreport.DirectionInbound, int(n), attribution)
 			}}, []N.CountFunc{func(n int64) {
-				outboundCounter.CountOut(n)
-				dnsCounter.CountOut(n)
 				recorder.Touch(powerreport.DirectionOutbound, int(n), attribution)
 			}})
 		}
@@ -461,17 +450,9 @@ func (d *DefaultDialer) trackPacketConn(ctx context.Context, destination M.Socks
 		if recorder != nil {
 			recorder.CountConnectionOpened()
 			attribution := d.dialAttribution(ctx, destination)
-			outboundCounter := recorder.TrafficCounter(powerreport.TrafficOutbound, attribution.Outbound)
-			dnsCounter := recorder.TrafficCounter(powerreport.TrafficDNSTransport, attribution.DNS)
-			outboundCounter.CountDial()
-			dnsCounter.CountDial()
 			conn = bufio.NewNetPacketConn(bufio.NewCounterPacketConn(bufio.NewPacketConn(conn), []N.CountFunc{func(n int64) {
-				outboundCounter.CountIn(n)
-				dnsCounter.CountIn(n)
 				recorder.Touch(powerreport.DirectionInbound, int(n), attribution)
 			}}, []N.CountFunc{func(n int64) {
-				outboundCounter.CountOut(n)
-				dnsCounter.CountOut(n)
 				recorder.Touch(powerreport.DirectionOutbound, int(n), attribution)
 			}}))
 		}
@@ -510,8 +491,8 @@ func (d *DefaultDialer) dialAttribution(ctx context.Context, destination M.Socks
 			ProcessID:    metadata.ProcessInfo.ProcessID,
 			UserID:       metadata.ProcessInfo.UserId,
 			UserName:     metadata.ProcessInfo.UserName,
-			ProcessPaths: metadata.ProcessInfo.ProcessPaths,
-			PackageNames: metadata.ProcessInfo.PackageNames,
+			ProcessPath:  metadata.ProcessInfo.ProcessPath,
+			PackageNames: metadata.ProcessInfo.AndroidPackageNames,
 		}
 	}
 	attribution.Rule = metadata.RouteRule

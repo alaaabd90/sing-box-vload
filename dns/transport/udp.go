@@ -22,10 +22,7 @@ import (
 	mDNS "github.com/miekg/dns"
 )
 
-var (
-	_ adapter.DNSTransport         = (*UDPTransport)(nil)
-	_ adapter.IdleConnectionKeeper = (*UDPTransport)(nil)
-)
+var _ adapter.DNSTransport = (*UDPTransport)(nil)
 
 func RegisterUDP(registry *dns.TransportRegistry) {
 	dns.RegisterTransport[option.RemoteDNSServerOptions](registry, C.DNSTypeUDP, NewUDP)
@@ -92,14 +89,6 @@ func (t *UDPTransport) Close() error {
 
 func (t *UDPTransport) Reset() {
 	t.multiplexer.Reset()
-}
-
-func (t *UDPTransport) SetKeepIdleConnections(keep bool) {
-	t.multiplexer.SetKeepIdleConnections(keep)
-}
-
-func (t *UDPTransport) CloseIdleConnections() {
-	t.multiplexer.CloseIdleConnections()
 }
 
 func (t *UDPTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {

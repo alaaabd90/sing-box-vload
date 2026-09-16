@@ -9,8 +9,6 @@ import (
 	"net/netip"
 	"os"
 	"strings"
-	"sync"
-	"sync/atomic"
 
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/service/powerreport"
@@ -35,14 +33,11 @@ type Endpoint struct {
 	allowedAddress []netip.Prefix
 	tunDevice      Device
 	returnDevice   *returnDeviceWrapper
-	device         atomic.Pointer[device.Device]
+	device         *device.Device
 	allowedIPs     *device.AllowedIPs
 	egressPool     *tun.UDPEgressPool
 	pause          pause.Manager
 	pauseCallback  *list.Element[pause.Callback]
-	stateAccess    sync.Mutex
-	suspended      atomic.Bool
-	networkPaused  bool
 }
 
 func NewEndpoint(options EndpointOptions) (*Endpoint, error) {
@@ -163,12 +158,9 @@ func (e *Endpoint) Start(postStart bool) error {
 			recorder := powerManager.Recorder()
 			if recorder != nil {
 				attribution := &powerreport.Attribution{Endpoint: e.options.Tag}
-				counter := recorder.TrafficCounter(powerreport.TrafficEndpoint, e.options.Tag)
 				standardBind.SetIOActivityFuncs(func(size int) {
-					counter.CountIn(int64(size))
 					recorder.Touch(powerreport.DirectionInbound, size, attribution)
 				}, func(size int) {
-					counter.CountOut(int64(size))
 					recorder.Touch(powerreport.DirectionOutbound, size, attribution)
 				})
 			}
@@ -251,7 +243,7 @@ func (e *Endpoint) Start(postStart bool) error {
 			return endpoints, nil
 		})
 	}
-	e.device.Store(wgDevice)
+	e.device = wgDevice
 	e.pause = service.FromContext[pause.Manager](e.options.Context)
 	if e.pause != nil {
 		e.pauseCallback = e.pause.RegisterCallback(e.onPauseUpdated)
@@ -264,7 +256,6 @@ func (e *Endpoint) DialContext(ctx context.Context, network string, destination 
 	if !destination.Addr.IsValid() {
 		return nil, E.Cause(os.ErrInvalid, "invalid non-IP destination")
 	}
-	e.resume()
 	return e.tunDevice.DialContext(ctx, network, destination)
 }
 
@@ -272,49 +263,7 @@ func (e *Endpoint) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	if !destination.Addr.IsValid() {
 		return nil, E.Cause(os.ErrInvalid, "invalid non-IP destination")
 	}
-	e.resume()
 	return e.tunDevice.ListenPacket(ctx, destination)
-}
-
-func (e *Endpoint) SetIdle(idle bool) {
-	e.stateAccess.Lock()
-	defer e.stateAccess.Unlock()
-	wgDevice := e.device.Load()
-	if wgDevice == nil {
-		return
-	}
-	if idle {
-		if e.suspended.Load() {
-			return
-		}
-		e.suspended.Store(true)
-		wgDevice.Down()
-	} else if e.options.System {
-		e.resumeLocked(wgDevice)
-	}
-}
-
-func (e *Endpoint) resume() {
-	if !e.suspended.Load() {
-		return
-	}
-	e.stateAccess.Lock()
-	defer e.stateAccess.Unlock()
-	wgDevice := e.device.Load()
-	if wgDevice == nil {
-		return
-	}
-	e.resumeLocked(wgDevice)
-}
-
-func (e *Endpoint) resumeLocked(wgDevice *device.Device) {
-	if !e.suspended.Load() {
-		return
-	}
-	e.suspended.Store(false)
-	if !e.networkPaused {
-		wgDevice.Up()
-	}
 }
 
 func (e *Endpoint) Close() error {
@@ -326,14 +275,10 @@ func (e *Endpoint) Close() error {
 		e.egressPool.Close()
 		e.egressPool = nil
 	}
-	e.stateAccess.Lock()
-	wgDevice := e.device.Swap(nil)
-	if wgDevice != nil {
-		wgDevice.Down()
-		wgDevice.Close()
-	}
-	e.stateAccess.Unlock()
-	if wgDevice != nil {
+	if e.device != nil {
+		e.device.Down()
+		e.device.Close()
+		e.device = nil
 		return nil
 	}
 	return e.tunDevice.Close()
@@ -347,29 +292,18 @@ func (e *Endpoint) Lookup(address netip.Addr) *device.Peer {
 }
 
 func (e *Endpoint) BindUpdate() error {
-	wgDevice := e.device.Load()
-	if wgDevice == nil {
+	if e.device == nil {
 		return nil
 	}
-	return wgDevice.BindUpdate()
+	return e.device.BindUpdate()
 }
 
 func (e *Endpoint) onPauseUpdated(event int) {
-	e.stateAccess.Lock()
-	defer e.stateAccess.Unlock()
-	wgDevice := e.device.Load()
-	if wgDevice == nil {
-		return
-	}
 	switch event {
 	case pause.EventNetworkPause:
-		e.networkPaused = true
-		wgDevice.Down()
+		e.device.Down()
 	case pause.EventNetworkWake:
-		e.networkPaused = false
-		if !e.suspended.Load() {
-			wgDevice.Up()
-		}
+		e.device.Up()
 	}
 }
 

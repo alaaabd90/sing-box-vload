@@ -28,7 +28,6 @@ type GunConn struct {
 	create        chan struct{}
 	err           error
 	readRemaining int
-	onClose       func()
 }
 
 func newGunConn(reader io.Reader, writer io.Writer, flusher http.Flusher) *GunConn {
@@ -142,11 +141,7 @@ func (c *GunConn) FrontHeadroom() int {
 }
 
 func (c *GunConn) Close() error {
-	err := common.Close(c.rawReader, c.writer)
-	if c.onClose != nil {
-		c.onClose()
-	}
-	return err
+	return common.Close(c.rawReader, c.writer)
 }
 
 func (c *GunConn) LocalAddr() net.Addr {

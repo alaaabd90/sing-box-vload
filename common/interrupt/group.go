@@ -33,7 +33,7 @@ func (g *Group) NewPacketConn(conn net.PacketConn, isExternal bool) net.PacketCo
 	g.access.Lock()
 	defer g.access.Unlock()
 	item := g.connections.PushBack(&groupConnItem{conn, isExternal})
-	return newPacketConn(g, conn, item)
+	return &PacketConn{PacketConn: conn, group: g, element: item}
 }
 
 func (g *Group) Interrupt(interruptExternalConnections bool) {
