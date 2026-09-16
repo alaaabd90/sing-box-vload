@@ -817,6 +817,14 @@ func (r *Router) actionSniff(
 			packetSniffers = defaultPacketSniffers
 		}
 		var err error
+		// vload: declared ahead of the buffered-packets loop below (rather
+		// than immediately before the read-loop that uses them) because a
+		// goto in that loop jumps to the finally label past this point -
+		// Go disallows jumping into a variable's scope across its
+		// declaration, so these have to live above every goto that can
+		// skip over them. See the read-loop below for what they're for.
+		const singleSniffMaxAttempts = 4
+		sniffAttempts := 0
 		for _, packetBuffer := range inputPacketBuffers {
 			if quicMoreData() {
 				err = sniff.PeekPacket(
@@ -842,7 +850,27 @@ func (r *Router) actionSniff(
 			goto finally
 		}
 		packetBuffers = inputPacketBuffers
+		// vload: this loop used to have no bound of its own - a UDP flow
+		// that sent one packet looking like a fragmented QUIC client hello
+		// and then went silent forever (exactly what happens when an app
+		// abandons a flow mid-request instead of closing it, e.g. scrolling
+		// past a video before it finishes buffering) would sit here
+		// retrying a fresh 300ms read forever, bounded only by however long
+		// the inbound's own context lives - which for a TUN inbound is the
+		// whole VPN session, not this one flow. Real, non-abandoned
+		// fragmented QUIC client hellos resolve within one or two extra
+		// packets in practice; singleSniffMaxAttempts (declared above, with
+		// the buffered-packets loop) gives real traffic generous room while
+		// making an abandoned flow give up and forward unclassified
+		// (falling back to this router's normal short-lived UDP timeout
+		// instead of accumulating indefinitely) rather than leaking a
+		// goroutine and a read loop for the rest of the session.
 		for {
+			sniffAttempts++
+			if sniffAttempts > singleSniffMaxAttempts {
+				r.logger.DebugContext(ctx, "giving up on fragmented QUIC client hello after ", singleSniffMaxAttempts, " attempts")
+				break
+			}
 			var (
 				sniffBuffer = buf.NewPacket()
 				destination M.Socksaddr
