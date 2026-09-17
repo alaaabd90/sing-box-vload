@@ -62,7 +62,15 @@ func (t *Transport) Reset() {
 func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
 	question := message.Question[0]
 	if question.Qtype != mDNS.TypeA && question.Qtype != mDNS.TypeAAAA {
-		return nil, E.New("only IP queries are supported by fakeip")
+		// vload: answer non-A/AAAA queries (HTTPS/SVCB records, which
+		// Chrome sends routinely for HTTP/3 upgrade hints) with an empty
+		// NOERROR instead of an error. fakeip can't synthesize those record
+		// types, but a real answer for them is optional - erroring left the
+		// hijacked DNS packet unanswered (route/dns.go only writes a
+		// response when err == nil), so the caller just stalled until its
+		// own query timeout instead of getting an immediate, correct "no
+		// such record" and falling back right away.
+		return dns.FixedResponseStatus(message, mDNS.RcodeSuccess), nil
 	}
 	if question.Qtype == mDNS.TypeA && !t.inet4Enabled || question.Qtype == mDNS.TypeAAAA && !t.inet6Enabled {
 		return dns.FixedResponseStatus(message, mDNS.RcodeSuccess), nil
