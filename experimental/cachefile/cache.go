@@ -58,6 +58,8 @@ type CacheFile struct {
 	saveMetadata       *adapter.FakeIPMetadata
 	saveMetadataTimer  *time.Timer
 	saveFakeIPAccess   sync.RWMutex
+	saveFakeIPWG       sync.WaitGroup
+	saveFakeIPClosed   bool
 	saveDomain         map[netip.Addr]string
 	saveAddress4       map[string]netip.Addr
 	saveAddress6       map[string]netip.Addr
@@ -240,6 +242,21 @@ func (c *CacheFile) start() error {
 }
 
 func (c *CacheFile) Close() error {
+	// DNS replies can precede their asynchronous disk writes. Finish those
+	// writes before closing the DB so a normal VPN restart keeps every mapping.
+	c.saveFakeIPAccess.Lock()
+	c.saveFakeIPClosed = true
+	c.saveFakeIPAccess.Unlock()
+	c.saveFakeIPWG.Wait()
+	c.saveMetadataAccess.Lock()
+	if c.saveMetadataTimer != nil {
+		c.saveMetadataTimer.Stop()
+	}
+	metadata := c.saveMetadata
+	c.saveMetadataAccess.Unlock()
+	if metadata != nil {
+		_ = c.FakeIPSaveMetadata(metadata)
+	}
 	c.dbAccess.RLock()
 	db := c.DB
 	c.dbAccess.RUnlock()

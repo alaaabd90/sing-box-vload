@@ -80,6 +80,14 @@ func (s *Store) Start() error {
 			s.inet6Current = s.inet6Range.Addr().Next()
 		}
 		_ = storage.FakeIPReset()
+		// Keep the range/initial cursor durable from the start. Subsequent
+		// asynchronous mappings can recover their high-water mark on restart.
+		if err := storage.FakeIPSaveMetadata(&adapter.FakeIPMetadata{
+			Inet4Range: s.inet4Range, Inet6Range: s.inet6Range,
+			Inet4Current: s.inet4Current, Inet6Current: s.inet6Current,
+		}); err != nil {
+			return err
+		}
 	}
 	s.storage = storage
 	return nil

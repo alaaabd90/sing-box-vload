@@ -39,6 +39,8 @@ var defaultPacketSniffers = []sniff.PacketSniffer{
 	sniff.NTP,
 }
 
+var errMissingFakeIP = errors.New("missing fakeip record")
+
 // Deprecated: use RouteConnectionEx instead.
 func (r *Router) RouteConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) error {
 	done := make(chan any)
@@ -107,6 +109,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	}
 	selectedRule, _, buffers, _, err := r.matchRule(ctx, &metadata, conn, nil)
 	if err != nil {
+		buf.ReleaseMulti(buffers)
 		return err
 	}
 	var selectedOutbound adapter.Outbound
@@ -242,6 +245,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 	}
 	selectedRule, _, _, packetBuffers, err := r.matchRule(ctx, &metadata, nil, conn)
 	if err != nil {
+		N.ReleaseMultiPacketBuffer(packetBuffers)
 		return err
 	}
 	var selectedOutbound adapter.Outbound
@@ -603,7 +607,7 @@ func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.Inb
 			// (see the comment above) was accepting a miss gracefully rather
 			// than treating it as some larger router-level failure; failing
 			// this single connection fast still does that.
-			return E.New("missing fakeip record for ", metadata.Destination.Addr, ", try enable `experimental.cache_file`")
+			return E.Cause(errMissingFakeIP, metadata.Destination.Addr)
 		}
 	} else if metadata.Domain == "" {
 		domain, loaded := r.dns.LookupReverseMapping(metadata.Destination.Addr)
@@ -628,6 +632,9 @@ func (r *Router) matchRule(
 	buffers []*buf.Buffer, packetBuffers []*N.PacketBuffer, fatalErr error,
 ) {
 	fatalErr = r.prepareMatchMetadata(ctx, metadata)
+	if errors.Is(fatalErr, errMissingFakeIP) {
+		buffers, packetBuffers, fatalErr = r.recoverFakeIPConnection(ctx, metadata, inputConn, inputPacketConn)
+	}
 	if fatalErr != nil {
 		return
 	}

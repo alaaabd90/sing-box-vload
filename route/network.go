@@ -223,7 +223,15 @@ func (r *NetworkManager) Start(stage adapter.StartStage) error {
 			// Every monitor implementation has already delivered the initial state when Start returned:
 			// sing-tun checks routes synchronously, the Apple client blocks on the first NWPathMonitor update,
 			// and the Android client resolves the active network before setListener returns.
-			r.notifyInterfaceUpdate(r.interfaceMonitor.DefaultInterface(), 0)
+			// Some embedding apps manage networks themselves (including
+			// per-slot reset/protection) and expose no native snapshot. Nil
+			// then means "owned by platform", not an actual network outage.
+			managed, external := r.interfaceMonitor.(interface{ PlatformManagesNetworkState() bool })
+			if external && managed.PlatformManagesNetworkState() {
+				r.logger.Debug("network availability managed by platform")
+			} else {
+				r.notifyInterfaceUpdate(r.interfaceMonitor.DefaultInterface(), 0)
+			}
 		}
 	}
 	return nil

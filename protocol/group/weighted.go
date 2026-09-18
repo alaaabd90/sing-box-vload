@@ -121,6 +121,9 @@ type Weighted struct {
 	// Wi-Fi roaming between APs) tore down the *other*, unaffected slot's
 	// perfectly healthy connections too.
 	memberConns []sync.Map
+	// Physical availability is separate from circuit-breaker cooldown. A
+	// fallback probe or an old recovery timer cannot resurrect a lost radio.
+	unavailableNetworks sync.Map // member index -> struct{}
 	// hedgeLossStreak/hedgeSuppressedUntil let a member whose hedge races
 	// are essentially always lost - not failed, just consistently slower
 	// than whichever other member keeps winning for the same destination -
@@ -230,6 +233,14 @@ func (w *Weighted) All() []string {
 // An explicit call also resets that member's circuit breaker state, so a
 // platform-confirmed "network is up" always overrides a stale trip.
 func (w *Weighted) UpdateAvailability(index int, available bool) {
+	if index < 0 || index >= len(w.health) {
+		return
+	}
+	if available {
+		w.unavailableNetworks.Delete(index)
+	} else {
+		w.unavailableNetworks.Store(index, struct{}{})
+	}
 	w.logger.Info("vload: slot ", index, " availability -> ", available)
 	w.picker.SetAvailable(index, available)
 	if index >= 0 && index < len(w.health) {
@@ -244,6 +255,11 @@ func (w *Weighted) UpdateAvailability(index int, available bool) {
 			h.ejectionCount.Store(0)
 		}
 	}
+}
+
+func (w *Weighted) networkAvailable(index int) bool {
+	_, unavailable := w.unavailableNetworks.Load(index)
+	return !unavailable
 }
 
 // recordResult feeds one connection's outcome into index's circuit breaker.
@@ -339,7 +355,7 @@ func (w *Weighted) pickExcept(exclude int) (int, weightedMember, error) {
 			if i == exclude {
 				continue
 			}
-			if w.picker.IsAvailable(i) {
+			if w.networkAvailable(i) && w.picker.IsAvailable(i) {
 				best = i
 				break
 			}
@@ -351,7 +367,7 @@ func (w *Weighted) pickExcept(exclude int) (int, weightedMember, error) {
 			if i == exclude {
 				continue
 			}
-			if !w.picker.IsAvailable(i) {
+			if !w.networkAvailable(i) || !w.picker.IsAvailable(i) {
 				continue
 			}
 			h := w.limiters[i].headroom()
@@ -374,13 +390,17 @@ func (w *Weighted) pickExcept(exclude int) (int, weightedMember, error) {
 		// Every other member is breaker-tripped - fall back to plain
 		// rotation (ignoring headroom entirely) so we keep probing rather
 		// than stalling every new connection outright.
-		fallback := w.picker.Next()
-		if fallback != exclude {
-			best = fallback
+		// Probe breaker-tripped members only while their physical network
+		// still exists. Never dial through another radio as a substitute.
+		start := w.picker.Next()
+		for i := range w.members {
+			candidate := (start + i) % len(w.members)
+			if candidate != exclude && w.networkAvailable(candidate) {
+				best = candidate
+				break
+			}
 		}
-		// fallback == exclude means the only member the picker could offer
-		// is the one we're specifically avoiding - genuinely nothing else
-		// to try right now, best stays -1.
+		// No physically present alternative leaves best at -1.
 	}
 	// Deliberately no hard admission ceiling here even when a member's own
 	// headroom has gone deeply negative (e.g. it's the sole breaker-available
@@ -476,11 +496,11 @@ type hedgeResult[T io.Closer] struct {
 // A race loser is never counted against its member's health (see
 // abandonHedgeLoser): canceling mid-dial because the other side already won
 // is our choice, not evidence the member is unhealthy.
-func hedgedPick[T io.Closer](w *Weighted, ctx context.Context, dial func(context.Context, adapter.Outbound) (T, error)) (int, T, error) {
+func hedgedPick[T io.Closer](w *Weighted, ctx context.Context, dial func(context.Context, adapter.Outbound) (T, error)) (int, T, context.CancelFunc, error) {
 	var zero T
 	primaryIdx, primaryMember, err := w.pick()
 	if err != nil {
-		return -1, zero, err
+		return -1, zero, nil, err
 	}
 
 	start := func(idx int, member weightedMember) (<-chan hedgeResult[T], context.CancelFunc) {
@@ -494,7 +514,11 @@ func hedgedPick[T io.Closer](w *Weighted, ctx context.Context, dial func(context
 	}
 
 	primaryCh, primaryCancel := start(primaryIdx, primaryMember)
-	defer primaryCancel()
+	defer func() {
+		if primaryCancel != nil {
+			primaryCancel()
+		}
+	}()
 
 	var secondaryCh <-chan hedgeResult[T]
 	var secondaryCancel context.CancelFunc
@@ -539,7 +563,11 @@ func hedgedPick[T io.Closer](w *Weighted, ctx context.Context, dial func(context
 					secondaryCancel()
 					abandonHedgeLoser(w, secondaryCh)
 				}
-				return res.index, res.conn, nil
+				// Lazy TFO/UDP transports still need the winning dial context
+				// for their first write. The returned connection owns it now.
+				winnerCancel := primaryCancel
+				primaryCancel = nil
+				return res.index, res.conn, winnerCancel, nil
 			}
 			// A genuine failure, not a cancellation - this attempt is done
 			// either way (we're either racing a different secondary or
@@ -548,11 +576,11 @@ func hedgedPick[T io.Closer](w *Weighted, ctx context.Context, dial func(context
 			w.release(res.index)
 			primaryFailed = true
 			if secondaryFailed {
-				return -1, zero, res.err
+				return -1, zero, nil, res.err
 			}
 			trySecondary()
 			if secondaryCh == nil {
-				return -1, zero, res.err
+				return -1, zero, nil, res.err
 			}
 		case res := <-secondaryCh:
 			secondaryCh = nil
@@ -571,12 +599,14 @@ func hedgedPick[T io.Closer](w *Weighted, ctx context.Context, dial func(context
 				}
 				primaryCancel()
 				abandonHedgeLoser(w, primaryCh)
-				return res.index, res.conn, nil
+				winnerCancel := secondaryCancel
+				secondaryCancel = nil
+				return res.index, res.conn, winnerCancel, nil
 			}
 			w.release(res.index)
 			secondaryFailed = true
 			if primaryFailed {
-				return -1, zero, res.err
+				return -1, zero, nil, res.err
 			}
 		case <-timerC:
 			// Only the speculative "primary might just be slow" hedge is
@@ -599,7 +629,7 @@ func hedgedPick[T io.Closer](w *Weighted, ctx context.Context, dial func(context
 				secondaryCancel()
 				abandonHedgeLoser(w, secondaryCh)
 			}
-			return -1, zero, ctx.Err()
+			return -1, zero, nil, ctx.Err()
 		}
 	}
 }
@@ -610,6 +640,9 @@ func hedgedPick[T io.Closer](w *Weighted, ctx context.Context, dial func(context
 // no longer being wanted. Deliberately never calls recordResult - see
 // hedgedPick's doc comment.
 func abandonHedgeLoser[T io.Closer](w *Weighted, ch <-chan hedgeResult[T]) {
+	if ch == nil {
+		return // the primary already failed and its slot was released
+	}
 	go func() {
 		res := <-ch
 		w.release(res.index)
@@ -620,7 +653,7 @@ func abandonHedgeLoser[T io.Closer](w *Weighted, ch <-chan hedgeResult[T]) {
 }
 
 func (w *Weighted) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	index, conn, err := hedgedPick(w, ctx, func(dialCtx context.Context, ob adapter.Outbound) (net.Conn, error) {
+	index, conn, cancel, err := hedgedPick(w, ctx, func(dialCtx context.Context, ob adapter.Outbound) (net.Conn, error) {
 		return ob.DialContext(dialCtx, network, destination)
 	})
 	if err != nil {
@@ -628,6 +661,7 @@ func (w *Weighted) DialContext(ctx context.Context, network string, destination 
 	}
 	wrapped := &weightedCountedConn{Conn: conn}
 	wrapped.release = func() {
+		cancel()
 		w.release(index)
 		if index >= 0 && index < len(w.memberConns) {
 			w.memberConns[index].Delete(wrapped)
@@ -640,7 +674,7 @@ func (w *Weighted) DialContext(ctx context.Context, network string, destination 
 }
 
 func (w *Weighted) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	index, conn, err := hedgedPick(w, ctx, func(dialCtx context.Context, ob adapter.Outbound) (net.PacketConn, error) {
+	index, conn, cancel, err := hedgedPick(w, ctx, func(dialCtx context.Context, ob adapter.Outbound) (net.PacketConn, error) {
 		return ob.ListenPacket(dialCtx, destination)
 	})
 	if err != nil {
@@ -650,6 +684,7 @@ func (w *Weighted) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	// embedded below - see the type's doc comment for why this matters.
 	wrapped := &weightedCountedPacketConn{NetPacketConn: bufio.NewPacketConn(conn)}
 	wrapped.release = func() {
+		cancel()
 		w.release(index)
 		if index >= 0 && index < len(w.memberConns) {
 			w.memberConns[index].Delete(wrapped)

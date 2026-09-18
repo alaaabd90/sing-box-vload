@@ -23,7 +23,7 @@ var (
 
 func (c *CacheFile) FakeIPMetadata() *adapter.FakeIPMetadata {
 	var metadata adapter.FakeIPMetadata
-	err := c.batch(func(tx *bbolt.Tx) error {
+	err := c.view(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket(bucketFakeIP)
 		if bucket == nil {
 			return os.ErrNotExist
@@ -32,11 +32,24 @@ func (c *CacheFile) FakeIPMetadata() *adapter.FakeIPMetadata {
 		if len(metadataBinary) == 0 {
 			return os.ErrInvalid
 		}
-		err := bucket.Delete(keyMetadata)
-		if err != nil {
+		if err := metadata.UnmarshalBinary(metadataBinary); err != nil {
 			return err
 		}
-		return metadata.UnmarshalBinary(metadataBinary)
+		// Reading metadata must not invalidate it: a killed session may never
+		// reach Store.Close. Also include mappings persisted after the last
+		// delayed metadata checkpoint so their addresses cannot be reissued.
+		return bucket.ForEach(func(key, _ []byte) error {
+			address, ok := netip.AddrFromSlice(key)
+			if !ok {
+				return nil
+			}
+			if address.Is4() && metadata.Inet4Range.Contains(address) && address.Compare(metadata.Inet4Current) > 0 {
+				metadata.Inet4Current = address
+			} else if address.Is6() && metadata.Inet6Range.Contains(address) && address.Compare(metadata.Inet6Current) > 0 {
+				metadata.Inet6Current = address
+			}
+			return nil
+		})
 	})
 	if err != nil {
 		return nil
@@ -106,6 +119,11 @@ func (c *CacheFile) FakeIPStore(address netip.Addr, domain string) error {
 
 func (c *CacheFile) FakeIPStoreAsync(address netip.Addr, domain string, logger logger.Logger) {
 	c.saveFakeIPAccess.Lock()
+	if c.saveFakeIPClosed {
+		c.saveFakeIPAccess.Unlock()
+		return
+	}
+	c.saveFakeIPWG.Add(1)
 	if oldDomain, loaded := c.saveDomain[address]; loaded {
 		if address.Is4() {
 			delete(c.saveAddress4, oldDomain)
@@ -121,6 +139,7 @@ func (c *CacheFile) FakeIPStoreAsync(address netip.Addr, domain string, logger l
 	}
 	c.saveFakeIPAccess.Unlock()
 	go func() {
+		defer c.saveFakeIPWG.Done()
 		err := c.FakeIPStore(address, domain)
 		if err != nil {
 			logger.Warn("save FakeIP cache: ", err)
@@ -189,14 +208,13 @@ func (c *CacheFile) FakeIPLoadDomain(domain string, isIPv6 bool) (netip.Addr, bo
 
 func (c *CacheFile) FakeIPReset() error {
 	return c.batch(func(tx *bbolt.Tx) error {
-		err := tx.DeleteBucket(bucketFakeIP)
-		if err != nil {
-			return err
+		for _, name := range [][]byte{bucketFakeIP, bucketFakeIPDomain4, bucketFakeIPDomain6} {
+			if tx.Bucket(name) != nil {
+				if err := tx.DeleteBucket(name); err != nil {
+					return err
+				}
+			}
 		}
-		err = tx.DeleteBucket(bucketFakeIPDomain4)
-		if err != nil {
-			return err
-		}
-		return tx.DeleteBucket(bucketFakeIPDomain6)
+		return nil
 	})
 }
